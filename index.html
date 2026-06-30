@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f1a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.svg">
+<title>有声读物</title>
+<link rel="stylesheet" href="css/style.css?v=13">
+</head>
+<body>
+
+<!-- ===== Bookshelf ===== -->
+<div id="upload-screen">
+  <div class="shelf-header">
+    <div class="shelf-top">
+      <div class="logo">🎧</div>
+      <div class="shelf-title">我的书架</div>
+    </div>
+    <div class="drop-zone" id="drop-zone">
+      <span class="dz-icon">＋</span>
+      <span class="dz-text">添加书籍</span>
+      <span class="dz-hint">TXT · PDF · EPUB · DOCX · MOBI · AZW3 · FB2</span>
+      <input type="file" id="file-input" hidden accept=".txt,.pdf,.epub,.docx,.mobi,.azw3,.prc,.fb2">
+    </div>
+  </div>
+
+  <div id="upload-progress" class="upload-progress hidden">
+    <div class="upload-progress-header">
+      <span class="upload-progress-icon">⏳</span>
+      <span class="upload-progress-title">正在上传/解析</span>
+    </div>
+    <div class="upload-progress-track">
+      <div class="upload-progress-fill" id="upload-progress-fill"></div>
+    </div>
+    <div class="upload-progress-label" id="upload-progress-label">正在解析...</div>
+  </div>
+
+  <div id="bookshelf-empty" class="empty-state">
+    <div class="empty-icon">📚</div>
+    <div class="empty-text">书架还是空的</div>
+    <div class="empty-hint">点击上方添加你的第一本书</div>
+  </div>
+
+  <div id="bookshelf-list" class="bookshelf"></div>
+
+  <div class="shelf-footer">
+    <span>📱 数据存储在本浏览器 · 不可跨浏览器共享</span>
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:10px;">
+      <button class="debug-btn" id="debug-books-btn" style="background:transparent;border:1px solid rgba(255,255,255,.15);color:var(--text-dim);padding:6px 12px;border-radius:14px;font-size:12px;cursor:pointer;">📊 诊断</button>
+      <button class="debug-btn" id="debug-recover-btn" style="background:transparent;border:1px solid rgba(100,200,255,.3);color:#88ccff;padding:6px 12px;border-radius:14px;font-size:12px;cursor:pointer;">🔧 恢复</button>
+      <button class="debug-btn" id="debug-clear-btn" style="background:transparent;border:1px solid rgba(255,90,90,.3);color:#ff8888;padding:6px 12px;border-radius:14px;font-size:12px;cursor:pointer;">🧹 清空</button>
+    </div>
+  </div>
+
+  <div id="debug-panel" class="debug-panel" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:9999;overflow:auto;padding:20px;">
+    <div style="max-width:680px;margin:40px auto;background:#1a1a2e;border-radius:12px;padding:20px;color:#e0e0e0;font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div style="font-size:16px;font-weight:600;">📊 诊断面板</div>
+        <button id="debug-close-btn" style="background:transparent;border:1px solid rgba(255,255,255,.2);color:#fff;padding:4px 12px;border-radius:8px;cursor:pointer;">关闭</button>
+      </div>
+      <pre id="debug-content" style="white-space:pre-wrap;word-break:break-all;max-height:70vh;overflow:auto;background:rgba(0,0,0,.3);padding:12px;border-radius:8px;">加载中...</pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Player ===== -->
+<div id="player-screen" class="hidden">
+  <div class="player-header">
+    <button class="back-btn" id="back-btn">←</button>
+    <div class="header-title" id="book-name">书名</div>
+  </div>
+
+  <div class="book-info">
+    <div class="book-name" id="book-name-display">书名</div>
+    <div class="book-meta" id="book-meta">加载中...</div>
+  </div>
+
+  <!-- Sentence Display -->
+  <div class="sentence-card" id="sentence-display">
+    <div class="sentence-dim">点击 ▶ 开始朗读</div>
+  </div>
+  <div class="sentence-counter" id="sentence-counter">0 / 0</div>
+
+  <!-- Player Controls -->
+  <div class="player-card">
+    <div class="progress-area">
+      <div class="progress-track" id="progress-track">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="ctrl-btn" id="prev-btn">⏮</button>
+      <button class="ctrl-btn main" id="play-btn">▶</button>
+      <button class="ctrl-btn" id="next-btn">⏭</button>
+    </div>
+
+    <div class="speed-row">
+      <span class="speed-label">语速</span>
+      <button class="speed-btn" data-speed="0.75">0.75x</button>
+      <button class="speed-btn active" data-speed="1">1x</button>
+      <button class="speed-btn" data-speed="1.25">1.25x</button>
+      <button class="speed-btn" data-speed="1.5">1.5x</button>
+      <button class="speed-btn" data-speed="2">2x</button>
+    </div>
+  </div>
+
+  <!-- Sleep Timer -->
+  <div class="timer-card">
+    <div class="timer-row">
+      <span class="timer-label">⏰ 定时关闭</span>
+      <button class="timer-btn" data-minutes="15">15</button>
+      <button class="timer-btn" data-minutes="30">30</button>
+      <button class="timer-btn" data-minutes="45">45</button>
+      <button class="timer-btn" data-minutes="60">60</button>
+      <button class="timer-btn" data-minutes="90">90</button>
+    </div>
+    <div id="timer-bar" class="timer-bar hidden">
+      <span>剩余 </span><span id="timer-display">--:--</span>
+      <button class="timer-cancel" id="cancel-timer">取消</button>
+    </div>
+  </div>
+
+  <!-- Chapters -->
+  <div class="chapter-section">
+    <div class="section-title">章节</div>
+    <div id="chapter-list"></div>
+    <div id="player-status" class="status-overlay hidden">
+      <div class="emoji" id="status-emoji">⏳</div>
+      <div class="msg" id="status-msg">正在解析...</div>
+    </div>
+  </div>
+</div>
+
+<script src="js/db.js?v=15"></script>
+<script src="js/tts.js?v=15"></script>
+<script src="js/parsers.js?v=15"></script>
+<script src="js/app.js?v=15"></script>
+</body>
+</html>
