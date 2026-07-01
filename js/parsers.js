@@ -251,16 +251,94 @@ var PARSERS = {
     if (onProgress) onProgress('正在加载 PDF...', 0.35)
     var pdfjsLib = window.pdfjsLib
     if (!pdfjsLib) throw new Error('PDF 解析库未加载')
-    var doc = await pdfjsLib.getDocument({ data: data }).promise
+
+    // === CMap 字符映射：解决中文 PDF 提取出乱码的问题 ===
+    // 1) 优先用 PDF.js 主库自带的版本号，从可靠的 jsdelivr 取 CMap 文件
+    // 2) 兜底：从 bootcdn 取（部分 CDN 不一定有 cmaps 目录）
+    var ver = (pdfjsLib.version || '4.9.155')
+    var cMapUrls = [
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + ver + '/cmaps/',
+      'https://cdn.bootcdn.net/ajax/libs/pdf.js/' + ver + '/cmaps/',
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + ver + '/cmaps/',
+      'https://unpkg.com/pdfjs-dist@' + ver + '/cmaps/',
+    ]
+    var standardFontUrls = [
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + ver + '/standard_fonts/',
+      'https://cdn.bootcdn.net/ajax/libs/pdf.js/' + ver + '/standard_fonts/',
+      'https://unpkg.com/pdfjs-dist@' + ver + '/standard_fonts/',
+    ]
+
+    // 探测 cMap URL 是否可用（用 HEAD 请求，节省时间）
+    var cMapUrl = cMapUrls[0]
+    var standardFontDataUrl = standardFontUrls[0]
+    try {
+      var probe = await fetch(cMapUrls[0] + 'Adobe-Japan1-UCS2.bcmap', { method: 'HEAD' })
+      if (!probe.ok) {
+        for (var i = 1; i < cMapUrls.length; i++) {
+          var p = await fetch(cMapUrls[i] + 'Adobe-Japan1-UCS2.bcmap', { method: 'HEAD' })
+          if (p.ok) { cMapUrl = cMapUrls[i]; break }
+        }
+      }
+    } catch (e) {
+      console.warn('[PDF] CMap 探测失败，用默认 URL:', cMapUrl)
+    }
+
+    var doc
+    try {
+      doc = await pdfjsLib.getDocument({
+        data: data,
+        cMapUrl: cMapUrl,
+        cMapPacked: true,
+        standardFontDataUrl: standardFontDataUrl,
+        isEvalSupported: false,
+        disableFontFace: true,
+        useSystemFonts: false,
+      }).promise
+    } catch (e1) {
+      // 兜底：不带 CMap 也能解析，但中文可能乱码
+      console.warn('[PDF] 带 CMap 加载失败，尝试无 CMap:', e1)
+      doc = await pdfjsLib.getDocument({ data: data }).promise
+    }
+
     var text = ''
     var total = doc.numPages
+    var MAX_CHARS = 12000000
     for (var i = 1; i <= total; i++) {
       var page = await doc.getPage(i)
-      var content = await page.getTextContent()
-      text += content.items.map(function(item) { return item.str }).join(' ') + '\n\n'
+      var content
+      try {
+        content = await page.getTextContent({
+          normalizeWhitespace: true,
+          disableCombineTextItems: false,
+          includeMarkedContent: false,
+        })
+      } catch (e2) {
+        content = await page.getTextContent()
+      }
+      // 拼接文本项，保留结构信息
+      var pageText = ''
+      var lastY = null
+      for (var k = 0; k < content.items.length; k++) {
+        var item = content.items[k]
+        if (!item.str) continue
+        // 根据 Y 坐标判断是否换行
+        if (lastY !== null && item.transform && Math.abs(item.transform[5] - lastY) > 5) {
+          pageText += '\n'
+        }
+        pageText += item.str + ' '
+        if (item.transform) lastY = item.transform[5]
+      }
+      text += pageText + '\n\n'
+      if (text.length > MAX_CHARS) {
+        text = text.slice(0, MAX_CHARS)
+        break
+      }
       if (onProgress) onProgress('解析 PDF 第 ' + i + '/' + total + ' 页...', 0.35 + (i / total) * 0.5)
+      // 每页让出主线程
+      if (i % 10 === 0) await new Promise(function(r) { setTimeout(r, 0) })
     }
     if (onProgress) onProgress('正在分割章节...', 0.95)
+    await new Promise(function(r) { setTimeout(r, 0) })
     return splitChapters(text.trim())
   },
 
