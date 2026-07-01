@@ -11,6 +11,7 @@ const App = {
 
   libStatus: {},
   _cdnBase: '',
+  _pdfCdnBase: '',
 
   async init() {
     this._bindEvents()
@@ -20,8 +21,8 @@ const App = {
     await this._loadLibs()
     this._hideLoading()
 
-    if (window.pdfjsLib && this._cdnBase) {
-      const base = this._cdnBase.replace(/\/[^/]+$/, '/')
+    if (window.pdfjsLib && this._pdfCdnBase) {
+      const base = this._pdfCdnBase.replace(/\/[^/]+$/, '/')
       window.pdfjsLib.GlobalWorkerOptions.workerSrc = base + 'pdf.worker.min.js'
     }
 
@@ -79,7 +80,12 @@ const App = {
       for (const url of lib.urls) {
         try {
           await this._loadLib(lib.name, url)
-          if (window[lib.name]) { ok = true; this._cdnBase = url; break }
+          if (window[lib.name]) {
+            ok = true
+            this._cdnBase = url
+            if (lib.name === 'pdfjsLib') this._pdfCdnBase = url
+            break
+          }
         } catch (e) {}
       }
       this.libStatus[lib.name] = ok
