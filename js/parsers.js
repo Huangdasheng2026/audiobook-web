@@ -253,8 +253,6 @@ var PARSERS = {
     if (!pdfjsLib) throw new Error('PDF 解析库未加载')
 
     // === CMap 字符映射：解决中文 PDF 提取出乱码的问题 ===
-    // 1) 优先用 PDF.js 主库自带的版本号，从可靠的 jsdelivr 取 CMap 文件
-    // 2) 兜底：从 bootcdn 取（部分 CDN 不一定有 cmaps 目录）
     var ver = (pdfjsLib.version || '4.9.155')
     var cMapUrls = [
       'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + ver + '/cmaps/',
@@ -268,7 +266,7 @@ var PARSERS = {
       'https://unpkg.com/pdfjs-dist@' + ver + '/standard_fonts/',
     ]
 
-    // 探测 cMap URL 是否可用（用 HEAD 请求，节省时间）
+    // 探测 cMap URL
     var cMapUrl = cMapUrls[0]
     var standardFontDataUrl = standardFontUrls[0]
     try {
@@ -280,66 +278,157 @@ var PARSERS = {
         }
       }
     } catch (e) {
-      console.warn('[PDF] CMap 探测失败，用默认 URL:', cMapUrl)
+      console.warn('[PDF] CMap 探测失败:', e)
     }
 
-    var doc
-    try {
-      doc = await pdfjsLib.getDocument({
-        data: data,
-        cMapUrl: cMapUrl,
-        cMapPacked: true,
-        standardFontDataUrl: standardFontDataUrl,
-        isEvalSupported: false,
-        disableFontFace: true,
-        useSystemFonts: false,
-      }).promise
-    } catch (e1) {
-      // 兜底：不带 CMap 也能解析，但中文可能乱码
-      console.warn('[PDF] 带 CMap 加载失败，尝试无 CMap:', e1)
-      doc = await pdfjsLib.getDocument({ data: data }).promise
+    // 检测 iOS Safari：Worker 模式经常出问题，强制用主线程模式
+    var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    if (isIOS) {
+      console.log('[PDF] iOS 设备检测到，使用主线程模式（不用 Worker）')
+      // 禁用 Worker 让 PDF.js 在主线程跑（iOS 上更稳定）
+      if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = ''
+      }
     }
+
+    // 多重回退加载方式
+    var doc
+    var loadMethod = 'unknown'
+    var loadAttempts = [
+      {
+        name: 'cMap+worker+useWorkerFetch',
+        opts: {
+          data: data,
+          cMapUrl: cMapUrl,
+          cMapPacked: true,
+          standardFontDataUrl: standardFontDataUrl,
+          isEvalSupported: false,
+          disableFontFace: true,
+          useSystemFonts: false,
+          useWorkerFetch: false,
+          verbosity: 0,
+        }
+      },
+      {
+        name: 'cMap+simple',
+        opts: {
+          data: data,
+          cMapUrl: cMapUrl,
+          cMapPacked: true,
+          isEvalSupported: false,
+          verbosity: 0,
+        }
+      },
+      {
+        name: 'minimal',
+        opts: { data: data, verbosity: 0 }
+      },
+    ]
+
+    for (var ai = 0; ai < loadAttempts.length; ai++) {
+      try {
+        doc = await pdfjsLib.getDocument(loadAttempts[ai].opts).promise
+        loadMethod = loadAttempts[ai].name
+        console.log('[PDF] 加载成功, 方式:', loadMethod)
+        break
+      } catch (eLoad) {
+        console.warn('[PDF] 加载方式', loadAttempts[ai].name, '失败:', eLoad.message || eLoad)
+      }
+    }
+    if (!doc) throw new Error('PDF 加载失败: 所有加载方式都失败')
 
     var text = ''
     var total = doc.numPages
     var MAX_CHARS = 12000000
+    var successPages = 0
+    var failPages = 0
+    var emptyPages = 0
+    var firstFailPage = -1
+    var firstFailError = ''
+    var lastReport = 0
+
+    console.log('[PDF] 开始解析, 总页数:', total, '加载方式:', loadMethod, 'CMap:', cMapUrl)
+
     for (var i = 1; i <= total; i++) {
-      var page = await doc.getPage(i)
-      var content
+      if (text.length >= MAX_CHARS) break
+
       try {
-        content = await page.getTextContent({
-          normalizeWhitespace: true,
-          disableCombineTextItems: false,
-          includeMarkedContent: false,
-        })
-      } catch (e2) {
-        content = await page.getTextContent()
-      }
-      // 拼接文本项，保留结构信息
-      var pageText = ''
-      var lastY = null
-      for (var k = 0; k < content.items.length; k++) {
-        var item = content.items[k]
-        if (!item.str) continue
-        // 根据 Y 坐标判断是否换行
-        if (lastY !== null && item.transform && Math.abs(item.transform[5] - lastY) > 5) {
-          pageText += '\n'
+        var page = await doc.getPage(i)
+        var content
+        try {
+          content = await page.getTextContent({
+            normalizeWhitespace: true,
+            disableCombineTextItems: false,
+            includeMarkedContent: false,
+          })
+        } catch (eTC) {
+          content = await page.getTextContent()
         }
-        pageText += item.str + ' '
-        if (item.transform) lastY = item.transform[5]
+
+        var pageText = ''
+        var lastY = null
+        var itemCount = content.items ? content.items.length : 0
+        for (var k = 0; k < itemCount; k++) {
+          var item = content.items[k]
+          if (!item.str) continue
+          if (lastY !== null && item.transform && Math.abs(item.transform[5] - lastY) > 5) {
+            pageText += '\n'
+          }
+          pageText += item.str + ' '
+          if (item.transform) lastY = item.transform[5]
+        }
+
+        if (pageText.trim().length > 0) {
+          text += pageText + '\n\n'
+          successPages++
+        } else {
+          emptyPages++
+        }
+      } catch (ePage) {
+        failPages++
+        if (firstFailPage < 0) {
+          firstFailPage = i
+          firstFailError = (ePage && (ePage.message || String(ePage))) || '未知错误'
+          console.error('[PDF] 第 1 次失败, 页码:', i, '错误:', firstFailError)
+        } else {
+          // 不再重复打印, 避免日志爆炸
+        }
       }
-      text += pageText + '\n\n'
-      if (text.length > MAX_CHARS) {
-        text = text.slice(0, MAX_CHARS)
-        break
-      }
+
       if (onProgress) onProgress('解析 PDF 第 ' + i + '/' + total + ' 页...', 0.35 + (i / total) * 0.5)
-      // 每页让出主线程
-      if (i % 10 === 0) await new Promise(function(r) { setTimeout(r, 0) })
+      // 每 3 页让出主线程（iPhone 上需要更频繁）
+      if (i % 3 === 0) await new Promise(function(r) { setTimeout(r, 0) })
+      // 定期日志
+      if (i - lastReport >= 20) {
+        lastReport = i
+        console.log('[PDF] 进度', i + '/' + total, '成功', successPages, '空页', emptyPages, '失败', failPages, '文本', text.length)
+      }
     }
+
+    var stats = {
+      total: total,
+      success: successPages,
+      empty: emptyPages,
+      fail: failPages,
+      textLength: text.length,
+      loadMethod: loadMethod,
+      cMapUrl: cMapUrl,
+      isIOS: isIOS,
+      firstFailPage: firstFailPage,
+      firstFailError: firstFailError,
+    }
+    if (typeof window !== 'undefined') window._lastPdfStats = stats
+    console.log('[PDF] 解析完成', JSON.stringify(stats))
+
     if (onProgress) onProgress('正在分割章节...', 0.95)
     await new Promise(function(r) { setTimeout(r, 0) })
-    return splitChapters(text.trim())
+    var chapters = splitChapters(text.trim())
+
+    // 内容过少时附加诊断信息到章节末尾, 用户可以看到解析状态
+    if (chapters.length === 1 && chapters[0] && chapters[0].content.length < 200) {
+      chapters[0].content += '\n\n---\n[解析诊断] ' + JSON.stringify(stats, null, 0)
+    }
+    return chapters
   },
 
   parseEPUB: async function(file, onProgress) {

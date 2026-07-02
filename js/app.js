@@ -239,6 +239,30 @@ const App = {
         })
       }
 
+      // PDF 解析诊断
+      if (window._lastPdfStats) {
+        const s = window._lastPdfStats
+        lines.push('━━━ PDF 解析诊断 ━━━')
+        lines.push('  总页数: ' + s.total)
+        lines.push('  成功页: ' + s.success)
+        lines.push('  空页: ' + s.empty)
+        lines.push('  失败页: ' + s.fail)
+        lines.push('  文本长度: ' + s.textLength + ' 字符')
+        lines.push('  加载方式: ' + s.loadMethod)
+        lines.push('  iOS 设备: ' + (s.isIOS ? '是' : '否'))
+        lines.push('  CMap URL: ' + s.cMapUrl)
+        if (s.firstFailPage > 0) {
+          lines.push('  ⚠️ 首次失败页: ' + s.firstFailPage)
+          lines.push('  ⚠️ 错误: ' + s.firstFailError)
+        }
+        if (s.fail > 0) {
+          lines.push('')
+          lines.push('👉 失败原因可能是 iOS Safari 的 PDF.js 兼容性问题。')
+          lines.push('   建议: 用电脑 Chrome 打开同一个 PDF 看是否正常。')
+        }
+        lines.push('')
+      }
+
       // 操作按钮
       lines.push('━━━ 操作 ━━━')
       lines.push('点击"恢复连接" → 强制重连数据库')
