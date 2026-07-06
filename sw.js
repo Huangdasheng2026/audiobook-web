@@ -1,4 +1,4 @@
-const CACHE = 'audiobook-v24-' + Date.now()
+const CACHE = 'audiobook-v33-' + Date.now()
 const URLS = ['/', '/index.html', '/css/style.css', '/js/app.js', '/js/tts.js', '/js/parsers.js', '/js/db.js', '/manifest.json']
 
 self.addEventListener('install', e => {
@@ -11,7 +11,7 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys().then(keys => Promise.all(
-      keys.filter(key => !key.startsWith('audiobook-v24')).map(key => caches.delete(key))
+      keys.filter(key => !key.startsWith('audiobook-v33')).map(key => caches.delete(key))
     )).then(() => self.clients.claim())
   )
 })

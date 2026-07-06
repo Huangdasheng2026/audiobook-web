@@ -1,5 +1,7 @@
 $port = 8080
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 解决中文乱码：把控制台输出编码改为 UTF-8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://127.0.0.1:$port/")
 $listener.Start()

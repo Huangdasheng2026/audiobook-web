@@ -157,6 +157,13 @@ const DB = {
 
   async _saveToLocalStorage(book) {
     try {
+      // 大小检查：localStorage 限制约 5MB，超过则跳过备份
+      // （OCR 出的长书可能 12MB+，写入会抛 QuotaExceededError）
+      const size = (book.chapters || []).reduce((s, ch) => s + (ch.content ? ch.content.length : 0), 0)
+      if (size > 800000) {
+        console.warn('[DB] 书籍太大(' + (size / 1024 / 1024).toFixed(1) + 'MB), 跳过 localStorage 备份')
+        return
+      }
       const data = localStorage.getItem(this._BACKUP_KEY)
       let books = data ? JSON.parse(data) : []
       const idx = books.findIndex(b => b.id === book.id)
@@ -167,7 +174,8 @@ const DB = {
       }
       localStorage.setItem(this._BACKUP_KEY, JSON.stringify(books))
     } catch (err) {
-      throw err
+      // localStorage 失败不能影响主保存流程（IndexedDB 已成功）
+      console.warn('[DB] localStorage 备份失败:', err && err.message)
     }
   },
 

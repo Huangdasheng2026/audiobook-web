@@ -72,6 +72,12 @@ const App = {
         'https://unpkg.com/jszip@3.10.1/dist/jszip.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
       ]},
+      { name: 'Tesseract', urls: [
+        'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+        'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js',
+        'https://lib.baomitu.com/tesseract.js/5.1.1/tesseract.min.js',
+      ]},
     ]
 
     for (const lib of libs) {
@@ -135,6 +141,42 @@ const App = {
     document.getElementById('cancel-timer').addEventListener('click', () => this._cancelTimer())
     const mobiLink = document.getElementById('mobi-url-btn')
     if (mobiLink) mobiLink.classList.add('hidden')
+
+    // 声色按钮
+    document.querySelectorAll('.voice-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        document.querySelectorAll('.voice-btn').forEach(x => x.classList.remove('active'))
+        b.classList.add('active')
+        if (TTS.setVoiceCategory(b.dataset.voice)) {
+          this._toast('已切换为' + b.textContent)
+        }
+      })
+    })
+    // 试听按钮
+    const previewBtn = document.getElementById('voice-preview-btn')
+    if (previewBtn) {
+      previewBtn.addEventListener('click', () => this._previewVoice())
+    }
+    // 监听 voice 列表加载完成，按当前选中分类重新匹配最佳 voice
+    TTS.onVoicesChanged = () => {
+      const active = document.querySelector('.voice-btn.active')
+      if (active) TTS.setVoiceCategory(active.dataset.voice)
+    }
+
+    // OCR 取消按钮
+    const ocrCancelBtn = document.getElementById('ocr-cancel-btn')
+    if (ocrCancelBtn) {
+      ocrCancelBtn.addEventListener('click', () => {
+        try {
+          if (typeof PARSERS !== 'undefined' && PARSERS.cancelOCR) {
+            PARSERS.cancelOCR()
+          } else if (window.PARSERS && window.PARSERS.cancelOCR) {
+            window.PARSERS.cancelOCR()
+          }
+        } catch (e) { console.warn('[OCR] 取消失败:', e) }
+        this._toast('已发送取消信号，等待当前页识别完成...')
+      })
+    }
 
     const dbgBtn = document.getElementById('debug-books-btn')
     if (dbgBtn) dbgBtn.addEventListener('click', () => this._showDebugPanel('books'))
@@ -446,10 +488,20 @@ const App = {
       const bar = document.getElementById('upload-progress')
       const fill = document.getElementById('upload-progress-fill')
       const label = document.getElementById('upload-progress-label')
+      const cancelBtn = document.getElementById('ocr-cancel-btn')
       if (bar) bar.classList.remove('hidden')
       const safePct = Math.max(2, Math.min(100, Math.round(pct * 100)))
       if (fill) fill.style.width = safePct + '%'
       if (label) label.textContent = (msg || '处理中...') + ' (' + safePct + '%)'
+      // 进度到 30% 之后才显示取消按钮（避免误触）
+      if (cancelBtn && safePct > 30) cancelBtn.classList.remove('hidden')
+    }
+
+    const hideProgress = () => {
+      const bar = document.getElementById('upload-progress')
+      const cancelBtn = document.getElementById('ocr-cancel-btn')
+      if (bar) bar.classList.add('hidden')
+      if (cancelBtn) cancelBtn.classList.add('hidden')
     }
 
     // 立即显示进度条，避免 0% 假象
@@ -457,7 +509,6 @@ const App = {
 
     let ticker = null
     let stopped = false
-    const stopTicker = () => { if (ticker) { clearInterval(ticker); ticker = null } stopped = true }
 
     try {
       // 后台独立 ticker，无论解析函数是否调用 onProgress 都会更新进度
@@ -475,21 +526,104 @@ const App = {
 
       setProgress(0.05, '正在读取文件 ' + file.name)
 
-      const chapters = await PARSERS.parse(file, (msg, pct) => {
-        if (stopped) return
-        const realPct = 0.05 + (pct || 0) * 0.8
-        if (realPct > syntheticPct) {
-          syntheticPct = realPct
-          setProgress(realPct, msg)
-        }
-      })
+      let chapters
+      try {
+        chapters = await PARSERS.parse(file, (msg, pct) => {
+          if (stopped) return
+          const realPct = 0.05 + (pct || 0) * 0.8
+          if (realPct > syntheticPct) {
+            syntheticPct = realPct
+            setProgress(realPct, msg)
+          }
+        })
+      } catch (parseErr) {
+        // === 检测到扫描版 PDF：弹窗问用户是否启用 OCR ===
+        if (parseErr && parseErr.code === 'NEEDS_OCR') {
+          // 停止初始 ticker
+          if (ticker) { clearInterval(ticker); ticker = null }
+          stopped = true
+          hideProgress()
+          const stats = parseErr.pdfStats || {}
+          const totalPages = stats.total || 0
+          // 估算时间: 假设每页 8 秒 (中等设备, scale=2)
+          const estSeconds = Math.round(totalPages * 8)
+          const estMinutes = Math.ceil(estSeconds / 60)
 
-      stopTicker()
-      setProgress(0.88, '正在分割句子...')
+          const ocrMode = await this._askForOCR({
+            totalPages: totalPages,
+            textLen: (parseErr.pdfText || '').length,
+            estMinutes: estMinutes,
+          })
+
+          if (ocrMode === 'fast' || ocrMode === 'full') {
+            // 用户选择 OCR
+            if (!this.libStatus.Tesseract) {
+              this._showLoading('正在加载 OCR 引擎...')
+              try {
+                await this._loadLibs(true)
+              } catch (e) {}
+              this._hideLoading()
+              if (!this.libStatus.Tesseract) {
+                this._showError('OCR 库加载失败，请检查网络后重试')
+                return
+              }
+            }
+
+            // 申请 Wake Lock 防止电脑休眠
+            await this._requestWakeLock()
+
+            // 根据模式决定 maxPages 和 renderScale
+            const maxPages = ocrMode === 'fast' ? Math.min(20, totalPages) : 0
+            const renderScale = ocrMode === 'fast' ? 1.5 : 2.0
+            const modeLabel = ocrMode === 'fast' ? '快速模式(前' + maxPages + '页)' : '全本识别'
+            const ocrEstSeconds = Math.round((maxPages > 0 ? maxPages : totalPages) * (renderScale === 1.5 ? 5 : 8))
+
+            stopped = false
+            // 重新启动 ticker（OCR 慢, 30s 不够）
+            const ocrStartTime = Date.now()
+            ticker = setInterval(() => {
+              if (stopped) return
+              const elapsed = (Date.now() - ocrStartTime) / 1000
+              // OCR 进度条: 缓慢增长到 95%
+              syntheticPct = Math.min(0.95, 0.1 + (elapsed / (ocrEstSeconds * 1.5)) * 0.85)
+              setProgress(syntheticPct, 'OCR ' + modeLabel + ' 中... 已用时 ' + Math.floor(elapsed) + 's')
+            }, 500)
+
+            setProgress(0.1, '准备 OCR 识别(' + modeLabel + ')...')
+
+            try {
+              chapters = await PARSERS.parsePDFWithOCR(file, (msg, pct) => {
+                if (stopped) return
+                const realPct = 0.1 + (pct || 0) * 0.88
+                if (realPct > syntheticPct) {
+                  syntheticPct = realPct
+                  setProgress(realPct, msg)
+                }
+              }, { maxPages: maxPages, renderScale: renderScale })
+            } finally {
+              // OCR 结束/失败/取消都要释放 Wake Lock
+              await this._releaseWakeLock()
+            }
+            // 停止 OCR ticker
+            if (ticker) { clearInterval(ticker); ticker = null }
+            stopped = true
+          } else {
+            // 用户选择用现有内容, 仍然保存（哪怕只有几页）
+            chapters = [{ title: file.name.replace(/\.[^.]+$/, ''), content: parseErr.pdfText || '(扫描版 PDF, 文字提取失败。建议重试时启用 OCR)' }]
+          }
+        } else {
+          throw parseErr
+        }
+      }
+
+      // 任何路径结束都清理 ticker
+      if (ticker) { clearInterval(ticker); ticker = null }
+      stopped = true
+      setProgress(0.96, '正在分割句子...')
       await new Promise(r => setTimeout(r, 30))
       const sentences = chapters.reduce(function(sum, ch) { return sum + splitIntoSentences(ch.content).length }, 0)
 
-      setProgress(0.95, '正在保存到书架...')
+      setProgress(0.97, '正在保存到书架...')
       const book = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         title: file.name.replace(/\.[^.]+$/, ''),
@@ -507,18 +641,114 @@ const App = {
       await DB.saveBook(book)
       setProgress(1.0, '完成!')
       this._toast('✓ 添加成功')
-      setTimeout(() => {
-        const el = document.getElementById('upload-progress')
-        if (el) el.classList.add('hidden')
-      }, 600)
+      setTimeout(hideProgress, 600)
       await this._renderBookshelf()
     } catch (err) {
-      stopTicker()
+      if (ticker) { clearInterval(ticker); ticker = null }
+      stopped = true
       console.error('addBook 失败:', err)
-      const bar = document.getElementById('upload-progress')
-      if (bar) bar.classList.add('hidden')
+      hideProgress()
       this._showError('解析失败: ' + (err.message || err))
     }
+  },
+
+  // OCR 确认弹窗（返回 'fast' | 'full' | 'skip'）
+  _askForOCR: function(info) {
+    return new Promise((resolve) => {
+      const modal = document.getElementById('ocr-confirm-modal')
+      const body = document.getElementById('ocr-confirm-body')
+      const yesBtn = document.getElementById('ocr-confirm-yes')
+      const fullBtn = document.getElementById('ocr-confirm-full')
+      const skipBtn = document.getElementById('ocr-confirm-skip')
+      if (!modal || !body || !yesBtn || !skipBtn) {
+        // 兜底用原生 confirm
+        resolve(window.confirm('检测到扫描版 PDF。是否启用 OCR？将耗时约 ' + (info.estMinutes || 5) + ' 分钟。') ? 'fast' : 'skip')
+        return
+      }
+      const fastPages = Math.min(20, info.totalPages)
+      const fastMin = Math.max(1, Math.round(fastPages * 8 / 60))
+      body.innerHTML =
+        '这本 PDF 共 <b>' + info.totalPages + '</b> 页，但只提取到 <b>' + info.textLen + '</b> 个字符。<br><br>' +
+        '原因：<b>99% 是扫描图</b>，PDF.js 只能读文字层。<br><br>' +
+        '⚠️ OCR 识别时不要关标签页、不要让电脑休眠。'
+      modal.classList.remove('hidden')
+      modal.style.display = 'flex'
+      const cleanup = () => {
+        modal.classList.add('hidden')
+        modal.style.display = 'none'
+        yesBtn.removeEventListener('click', onFast)
+        if (fullBtn) fullBtn.removeEventListener('click', onFull)
+        skipBtn.removeEventListener('click', onSkip)
+      }
+      const onFast = () => { cleanup(); resolve('fast') }
+      const onFull = () => { cleanup(); resolve('full') }
+      const onSkip = () => { cleanup(); resolve('skip') }
+      yesBtn.addEventListener('click', onFast)
+      if (fullBtn) fullBtn.addEventListener('click', onFull)
+      skipBtn.addEventListener('click', onSkip)
+    })
+  },
+
+  // 申请 Wake Lock 防止电脑休眠（OCR 期间需要）
+  _wakeLock: null,
+  async _requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        this._wakeLock = await navigator.wakeLock.request('screen')
+        console.log('[WakeLock] 已申请，防止休眠')
+        this._wakeLock.addEventListener('release', () => {
+          console.log('[WakeLock] 已释放')
+        })
+      } else {
+        console.warn('[WakeLock] 浏览器不支持，将无法防止休眠')
+      }
+    } catch (e) {
+      console.warn('[WakeLock] 申请失败:', e && e.message)
+    }
+  },
+  // 释放 Wake Lock
+  async _releaseWakeLock() {
+    try {
+      if (this._wakeLock) {
+        await this._wakeLock.release()
+        this._wakeLock = null
+      }
+    } catch (e) {}
+  },
+
+  // 试听当前选中的声色
+  _previewVoice() {
+    const btn = document.getElementById('voice-preview-btn')
+    if (!btn) return
+    const active = document.querySelector('.voice-btn.active')
+    if (!active) return
+    const category = active.dataset.voice
+    TTS.setVoiceCategory(category)
+
+    if (btn.classList.contains('previewing')) {
+      TTS.synth.cancel()
+      btn.classList.remove('previewing')
+      btn.textContent = '▶ 试听'
+      return
+    }
+    btn.classList.add('previewing')
+    btn.textContent = '⏹ 停止'
+    const samples = {
+      female: '这是普通话女声演示，有声读物让阅读更轻松。',
+      male: '这是普通话男声演示，有声读物让阅读更轻松。',
+      child: '这是儿童声音演示，让我们一起听故事吧。',
+      'mature-male': '这是成熟男声演示，沉稳大气，适合听书。',
+    }
+    const v = TTS.voice
+    const text = samples[category] || samples.female
+    const u = new SpeechSynthesisUtterance(text)
+    u.voice = v
+    u.rate = 1
+    u.lang = (v && v.lang) || 'zh-CN'
+    u.onend = () => { btn.classList.remove('previewing'); btn.textContent = '▶ 试听' }
+    u.onerror = () => { btn.classList.remove('previewing'); btn.textContent = '▶ 试听' }
+    TTS.synth.cancel()
+    TTS.synth.speak(u)
   },
 
   async openBook(id) {

@@ -165,26 +165,128 @@ async function readFileWithProgress(file, onProgress) {
   })
 }
 
+// 规范化 OCR 文本：把 Tesseract 识别出的碎片行重排成连贯段落
+// 核心：单 \n 只是换行，应被去掉（中文直接拼接，英文加空格）；双 \n 才是段落分隔
+function normalizeOCRText(text) {
+  if (!text) return ''
+  var inputLen = text.length
+  // 1. 统一换行符
+  text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  // 2. 去掉控制字符
+  text = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+  // 3. 去掉行首行尾空格
+  text = text.replace(/^[ \t]+|[ \t]+$/gm, '')
+  // 4. 合并连续空行
+  text = text.replace(/\n{3,}/g, '\n\n')
+
+  // 5. 以空行分段，段内合并所有行（去掉单换行，中文直接拼，英文加空格）
+  var paragraphs = text.split(/\n\s*\n/)
+  var out = []
+  for (var i = 0; i < paragraphs.length; i++) {
+    var p = paragraphs[i]
+    if (!p.trim()) continue
+    var lines = p.split('\n')
+    var buf = ''
+    for (var j = 0; j < lines.length; j++) {
+      var line = lines[j].trim()
+      if (!line) continue
+      if (!buf) { buf = line; continue }
+      var lastChar = buf.charAt(buf.length - 1)
+      var firstChar = line.charAt(0)
+      // 英文/数字串跨行需要空格，中文直接拼接
+      var needsSpace = /[a-zA-Z0-9]/.test(lastChar) && /[a-zA-Z0-9]/.test(firstChar)
+      buf += needsSpace ? (' ' + line) : line
+    }
+    if (buf) out.push(buf)
+  }
+  text = out.join('\n\n')
+
+  // 6. 关键修复：去掉中文字符之间的空格
+  // 旧正则 (\S)\s+(\S) 有 bug：匹配 "A B C D" 时只能去掉一半空格
+  // 解决方案：用 lookahead，让第二个字符不被消费，可以链式匹配
+  // "这 次 逆 势" → "这次逆势"（一次 replace 全部搞定）
+  var prev
+  do {
+    prev = text
+    text = text.replace(/([\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef])[ \t]+(?=[\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef])/g, '$1')
+  } while (text !== prev)  // 循环确保嵌套空格也去掉
+
+  // 7. 清理残留多余空格
+  text = text.replace(/[ \t]{2,}/g, ' ')
+
+  console.log('[normalizeOCRText] 输入:', inputLen, '字符 → 输出:', text.length, '字符')
+  console.log('[normalizeOCRText] 前200字:', text.substring(0, 200))
+  return text.trim()
+}
+
+if (typeof window !== 'undefined') window.normalizeOCRText = normalizeOCRText
+
 function splitIntoSentences(text) {
-  var raw = text.match(/[^。！？\n.!?]+[。！？\n.!?]?/g) || [text]
+  // 先规范化：去掉控制字符、合并多余空白
+  text = String(text || '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').replace(/[ \t]+/g, ' ').replace(/\n[ ]+/g, '\n').trim()
+  if (!text) return []
+  // 如果是 HTML 字符串，先转纯文本
+  if (/<[a-zA-Z!\/][^>]*>/.test(text)) {
+    text = htmlToPlainText(text)
+  }
+
+  // 第一步：按句号/感叹号/问号切分
+  var raw = text.match(/[^。！？.!?]+[。！？.!?]?/g) || [text]
   var result = []
-  var buf = ''
   for (var i = 0; i < raw.length; i++) {
-    var s = raw[i]
-    var t = s.trim()
-    if (!t) continue
-    if (t.length < 5 && !/[。！？.!?]/.test(t) && result.length > 0) {
-      result[result.length - 1] += t
+    var s = raw[i].replace(/\s+/g, ' ').trim()
+    if (!s) continue
+    // 短碎句（OCR 残留）合并到前一句
+    if (result.length > 0 && s.length < 8 && !/[。！？.!?]/.test(s)) {
+      result[result.length - 1] += s
     } else {
-      if (buf) {
-        result.push(buf)
-        buf = ''
-      }
-      result.push(t)
+      result.push(s)
     }
   }
-  if (buf) result.push(buf)
-  return result.filter(function(s) { return s.length > 0 })
+
+  // 第二步：如果句子平均长度 < 15（说明没有标点），按 30-40 字自动断句
+  var totalLen = result.reduce(function(s, x) { return s + x.length }, 0)
+  var avgLen = result.length ? totalLen / result.length : 0
+  if (avgLen < 15 && totalLen > 100) {
+    var flat = result.join('')
+    result = []
+    var start = 0
+    while (start < flat.length) {
+      var end = Math.min(start + 40, flat.length)
+      if (end < flat.length) {
+        for (var off = end; off > start + 20; off--) {
+          if (/[，、；：,;:]/.test(flat[off])) { end = off + 1; break }
+        }
+      }
+      result.push(flat.substring(start, end).trim())
+      start = end
+    }
+  }
+
+  // 第三步：任何句子超过 80 字，按逗号/顿号/分号二次拆分（TTS 单句太长会截断）
+  var final = []
+  for (var k = 0; k < result.length; k++) {
+    var seg = result[k]
+    if (seg.length <= 80) { final.push(seg); continue }
+    // 先按逗号等拆
+    var parts = seg.match(/[^，、；：,;:]+[，、；：,;:]?/g) || [seg]
+    for (var m = 0; m < parts.length; m++) {
+      var p = parts[m].trim()
+      if (!p) continue
+      if (p.length <= 80) { final.push(p); continue }
+      // 还太长，按 40 字硬切
+      var s2 = 0
+      while (s2 < p.length) {
+        final.push(p.substring(s2, Math.min(s2 + 40, p.length)).trim())
+        s2 += 40
+      }
+    }
+  }
+
+  console.log('[splitIntoSentences] 输入:', text.length, '字符 → 输出:', final.length, '句, 平均长度:', final.length ? Math.round(totalLen / final.length) : 0)
+  if (final.length > 0) console.log('[splitIntoSentences] 前3句:', final.slice(0, 3))
+
+  return final.filter(function(s) { return s.trim().length > 0 })
 }
 
 if (typeof window !== 'undefined') window.splitIntoSentences = splitIntoSentences
@@ -207,7 +309,15 @@ var PARSERS = {
     try {
       return await fn.call(this, file, onProgress)
     } catch (e) {
-      throw new Error('文件过大或格式异常: ' + (e.message || e))
+      // 保留自定义错误码和上下文（NEEDS_OCR 等），否则上层无法识别
+      var wrapped = new Error('文件过大或格式异常: ' + (e.message || e))
+      if (e && e.code) wrapped.code = e.code
+      if (e && e.pdfStats) wrapped.pdfStats = e.pdfStats
+      if (e && e.pdfText) wrapped.pdfText = e.pdfText
+      if (e && e.pdfData) wrapped.pdfData = e.pdfData
+      if (e && e.partialText !== undefined) wrapped.partialText = e.partialText
+      if (e && e.ocrStats) wrapped.ocrStats = e.ocrStats
+      throw wrapped
     }
   },
 
@@ -246,7 +356,8 @@ var PARSERS = {
     return splitChapters(text)
   },
 
-  parsePDF: async function(file, onProgress) {
+  parsePDF: async function(file, onProgress, options) {
+    options = options || {}
     var data = await readFileWithProgress(file, onProgress)
     if (onProgress) onProgress('正在加载 PDF...', 0.35)
     var pdfjsLib = window.pdfjsLib
@@ -285,7 +396,6 @@ var PARSERS = {
     var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
     if (isIOS) {
       console.log('[PDF] iOS 设备检测到，使用主线程模式（不用 Worker）')
-      // 禁用 Worker 让 PDF.js 在主线程跑（iOS 上更稳定）
       if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
         window.pdfjsLib.GlobalWorkerOptions.workerSrc = ''
       }
@@ -390,15 +500,11 @@ var PARSERS = {
           firstFailPage = i
           firstFailError = (ePage && (ePage.message || String(ePage))) || '未知错误'
           console.error('[PDF] 第 1 次失败, 页码:', i, '错误:', firstFailError)
-        } else {
-          // 不再重复打印, 避免日志爆炸
         }
       }
 
       if (onProgress) onProgress('解析 PDF 第 ' + i + '/' + total + ' 页...', 0.35 + (i / total) * 0.5)
-      // 每 3 页让出主线程（iPhone 上需要更频繁）
       if (i % 3 === 0) await new Promise(function(r) { setTimeout(r, 0) })
-      // 定期日志
       if (i - lastReport >= 20) {
         lastReport = i
         console.log('[PDF] 进度', i + '/' + total, '成功', successPages, '空页', emptyPages, '失败', failPages, '文本', text.length)
@@ -420,15 +526,211 @@ var PARSERS = {
     if (typeof window !== 'undefined') window._lastPdfStats = stats
     console.log('[PDF] 解析完成', JSON.stringify(stats))
 
-    if (onProgress) onProgress('正在分割章节...', 0.95)
-    await new Promise(function(r) { setTimeout(r, 0) })
-    var chapters = splitChapters(text.trim())
+    // === OCR 检测：文字太少（< 800字 或 90% 页是空的） ===
+    var isLikelyScanned = (
+      (stats.total > 5 && text.length < 800) ||
+      (stats.total > 5 && stats.empty / stats.total > 0.85 && text.length / stats.total < 30)
+    )
+    if (isLikelyScanned && !options.skipOCRPrompt) {
+      console.log('[PDF] 疑似扫描版 PDF, 文字过少:', text.length, '字符 /', stats.total, '页')
+      // 抛出特殊错误, 让上层决定是否走 OCR
+      var err = new Error('NEEDS_OCR:' + JSON.stringify({
+        stats: stats,
+        text: text,
+        data: data,
+      }))
+      err.code = 'NEEDS_OCR'
+      err.pdfData = data
+      err.pdfStats = stats
+      err.pdfText = text
+      throw err
+    }
 
-    // 内容过少时附加诊断信息到章节末尾, 用户可以看到解析状态
+    if (onProgress) onProgress('正在分割章节...', 0.95)
+      await new Promise(function(r) { setTimeout(r, 0) })
+      if (onProgress) onProgress('正在分割章节（文本较大，可能需要几秒）...', 0.96)
+      await new Promise(function(r) { setTimeout(r, 0) })
+      var chapters = splitChapters(text.trim())
+      if (onProgress) onProgress('章节分割完成', 0.98)
+
     if (chapters.length === 1 && chapters[0] && chapters[0].content.length < 200) {
       chapters[0].content += '\n\n---\n[解析诊断] ' + JSON.stringify(stats, null, 0)
     }
     return chapters
+  },
+
+  // === OCR 模式：用 Tesseract.js 识别扫描版 PDF ===
+  parsePDFWithOCR: async function(file, onProgress, options) {
+    options = options || {}
+    var data = await readFileWithProgress(file, onProgress)
+    if (onProgress) onProgress('正在加载 PDF...', 0.1)
+    var pdfjsLib = window.pdfjsLib
+    if (!pdfjsLib) throw new Error('PDF 解析库未加载')
+    var Tesseract = window.Tesseract
+    if (!Tesseract) throw new Error('OCR 库未加载')
+
+    if (onProgress) onProgress('正在初始化 OCR 引擎...', 0.15)
+    // 渲染 scale: 越高识别越准, 但越慢. 2.0 平衡点
+    var renderScale = options.renderScale || 2.0
+    // 限制最大页数（用于试读场景）
+    var maxPages = options.maxPages || 0  // 0 = 不限
+
+    // 加载 PDF 文档
+    var doc
+    try {
+      doc = await pdfjsLib.getDocument({
+        data: data,
+        isEvalSupported: false,
+        disableFontFace: true,
+        useSystemFonts: false,
+        verbosity: 0,
+      }).promise
+    } catch (e) {
+      doc = await pdfjsLib.getDocument({ data: data, verbosity: 0 }).promise
+    }
+    var total = doc.numPages
+    var processTotal = maxPages > 0 ? Math.min(maxPages, total) : total
+    console.log('[OCR] PDF 总页数:', total, '本次处理:', processTotal)
+
+    // 初始化 Tesseract Worker（带中文简体+英文）
+    var worker = null
+    var useWorker = false
+    try {
+      // Tesseract.js 5.x: createWorker
+      if (Tesseract.createWorker) {
+        worker = await Tesseract.createWorker(['chi_sim', 'eng'], 1, {
+          logger: function(m) {
+            if (m && m.status && onProgress) {
+              // m.status: 'recognizing text', 'loading tesseract core', 'initializing tesseract', 'loading language traineddata'
+              if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+                // 单页识别中
+                onProgress('OCR 识别中...', 0.2 + 0.70 * ((window._ocrPageProgress || 0) + m.progress) / processTotal)
+              }
+            }
+          }
+        })
+        useWorker = true
+        console.log('[OCR] Tesseract worker 已创建')
+      } else if (Tesseract.recognize) {
+        console.log('[OCR] 用 Tesseract.recognize 旧 API')
+      } else {
+        throw new Error('Tesseract 版本不支持')
+      }
+    } catch (eTess) {
+      console.error('[OCR] 创建 Tesseract worker 失败:', eTess)
+      throw new Error('OCR 引擎初始化失败: ' + (eTess.message || eTess))
+    }
+
+    if (onProgress) onProgress('开始 OCR 识别 (' + processTotal + '/' + total + ' 页)...', 0.2)
+
+    var text = ''
+    var MAX_CHARS = 12000000
+    var successPages = 0
+    var failPages = 0
+    var cancelled = false
+    window._ocrCancelled = false
+
+    // 预创建一个离屏 canvas 复用, 减少内存分配
+    var canvas = document.createElement('canvas')
+    var ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+    for (var i = 1; i <= processTotal; i++) {
+      if (window._ocrCancelled) { cancelled = true; break }
+      if (text.length >= MAX_CHARS) break
+
+      window._ocrPageProgress = i - 1
+      if (onProgress) onProgress('OCR 识别第 ' + i + '/' + processTotal + ' 页...', 0.2 + 0.75 * (i - 1) / processTotal)
+
+      try {
+        var page = await doc.getPage(i)
+        var viewport = page.getViewport({ scale: renderScale })
+        canvas.width = Math.ceil(viewport.width)
+        canvas.height = Math.ceil(viewport.height)
+        // 填充白底, 避免透明导致识别失败
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, canvas.width, canvas.height)
+        await page.render({ canvasContext: ctx, viewport: viewport }).promise
+
+        var result
+        if (useWorker) {
+          result = await worker.recognize(canvas)
+        } else {
+          result = await Tesseract.recognize(canvas, 'chi_sim+eng')
+        }
+        var pageText = (result && result.data && result.data.text) ? result.data.text : ''
+        if (pageText.trim().length > 0) {
+          text += pageText + '\n\n'
+          successPages++
+        }
+        // 清理 result 引用, 释放内存
+        if (result && result.data) {
+          try { result.data.text = '' } catch (e) {}
+        }
+      } catch (ePage) {
+        failPages++
+        console.warn('[OCR] 第', i, '页识别失败:', ePage.message || ePage)
+      }
+
+      // 让出主线程, 避免页面卡死
+      if (i % 2 === 0) await new Promise(function(r) { setTimeout(r, 0) })
+    }
+
+    // 清理
+    window._ocrPageProgress = processTotal
+    window._ocrCancelled = false
+    if (worker && worker.terminate) {
+      try { await worker.terminate() } catch (e) {}
+    }
+    // 释放 canvas
+    canvas.width = 0
+    canvas.height = 0
+
+    var stats = {
+      total: total,
+      processed: processTotal,
+      success: successPages,
+      fail: failPages,
+      textLength: text.length,
+      cancelled: cancelled,
+      renderScale: renderScale,
+    }
+    if (typeof window !== 'undefined') window._lastOcrStats = stats
+    console.log('[OCR] 完成', JSON.stringify(stats))
+
+    // 取消时或文本太少, 都允许保存（用户至少能看看识别出来的内容）
+    if (text.trim().length < 50) {
+      var msg = cancelled ? '已取消, 但未识别到文字' : 'OCR 未提取到有效文字（识别失败或文件异常）'
+      var e = new Error(msg)
+      e.code = 'OCR_EMPTY'
+      e.partialText = text
+      e.ocrStats = stats
+      throw e
+    }
+
+    if (onProgress) onProgress('正在分割章节...', 0.93)
+      await new Promise(function(r) { setTimeout(r, 0) })
+      if (onProgress) onProgress('正在规范化 OCR 文本...', 0.94)
+      await new Promise(function(r) { setTimeout(r, 0) })
+      // OCR 文本经常单字一行，先规范化（合并单字行/短英文/数字行）
+      text = normalizeOCRText(text)
+      if (onProgress) onProgress('正在分割章节（文本较大，可能需要几秒）...', 0.95)
+      await new Promise(function(r) { setTimeout(r, 0) })
+      var chapters = splitChapters(text.trim())
+      if (onProgress) onProgress('章节分割完成', 0.97)
+
+    // 取消时附加诊断信息
+    if (cancelled) {
+      var lastChapter = chapters[chapters.length - 1]
+      if (lastChapter) {
+        lastChapter.content += '\n\n---\n[OCR 部分识别: 共识别 ' + successPages + ' 页, 共 ' + stats.total + ' 页]'
+      }
+    }
+    return chapters
+  },
+
+  // 取消正在进行的 OCR
+  cancelOCR: function() {
+    window._ocrCancelled = true
   },
 
   parseEPUB: async function(file, onProgress) {
